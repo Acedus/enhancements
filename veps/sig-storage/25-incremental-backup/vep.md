@@ -134,7 +134,9 @@ Checkpoints are treated by KubeVirt as opaque resume tokens: `{name, creationTim
 
 ### Checkpoint redefinition
 
-Libvirt checkpoint metadata is transient and must be restored after VM restart. Redefinition uses `DOMAIN_CHECKPOINT_CREATE_REDEFINE` on its own; the `DOMAIN_CHECKPOINT_CREATE_REDEFINE_VALIDATE` flag used in alpha is dropped, because redefinition exists to restore metadata and bitmap integrity is now decided per-disk at backup start. Disks without bitmaps are excluded from the redefinition XML, so a checkpoint survives partial bitmap loss instead of being discarded as a whole.
+Libvirt checkpoint metadata is transient, so a VM restart or a migration to a fresh libvirt leaves none of it behind. Rather than restoring it up front, the base a backup needs is redefined at backup start, on the same path that already inspects every disk to decide per-disk backup type (see [Backup type model](#backup-type-model)). virt-launcher redefines it against exactly the disks that still carry its bitmap, then issues `BackupBegin`. Redefinition is idempotent, so it is a no-op when libvirt already holds the checkpoint, and nothing sequences a backup behind a separate redefinition pass.
+
+Redefinition uses `DOMAIN_CHECKPOINT_CREATE_REDEFINE` on its own; the `DOMAIN_CHECKPOINT_CREATE_REDEFINE_VALIDATE` flag used in alpha is dropped, because redefinition exists to restore metadata and bitmap integrity is decided per-disk at backup start. Disks without bitmaps are excluded from the redefinition XML, so a checkpoint survives partial bitmap loss instead of being discarded as a whole, and the `creationTime` the tracker keeps alongside the name is what libvirt requires to accept the redefinition.
 
 ### Full backup
 
@@ -158,7 +160,7 @@ If no tracker is referenced or the tracker has no checkpoint, a full backup is p
 
 ### VM crash
 
-After a VM crash, dirty bitmaps may not have been flushed to the QCOW2 metadata header and can come back flagged `inconsistent`. Checkpoints are no longer discarded for this reason: redefinition restores the checkpoint metadata for whichever disks still carry a bitmap, and the examination at backup start (see [Backup type model](#backup-type-model)) demotes each affected disk to full on its own. A post-crash backup is therefore full only for the disks whose bitmaps did not survive, and stays incremental for the rest.
+After a VM crash, dirty bitmaps may not have been flushed to the QCOW2 metadata header and can come back flagged `inconsistent`. Checkpoints are no longer discarded for this reason: at the next backup start the base is redefined against whichever disks still carry a bitmap, and the same examination (see [Backup type model](#backup-type-model)) demotes each affected disk to full on its own. A post-crash backup is therefore full only for the disks whose bitmaps did not survive, and stays incremental for the rest.
 
 ### Migration and backup
 
@@ -169,7 +171,7 @@ Backup and migration never run concurrently. Backup wins by default, and only a 
 
 Canceling the backup does not release the migration on its own. Both modes keep the backup PVC attached to the virt-launcher pod as a utility volume, so the migration then blocks on `migrationBlockedByUtilityVolumes` until the backup controller detaches it. That wait is bounded by `migrationConfiguration.utilityVolumesTimeout` (default 150 seconds, counted from the migration object's creation, so the time spent waiting for the cancellation is charged against the same budget). If the volume is still attached when the timeout expires, the migration itself fails.
 
-Dirty bitmaps are transferred with the disk image during migration. After migration, checkpoints are redefined for the new libvirt instance. If the VM state PVC is not shared, a new one is created. Incremental backups resume normally after redefinition.
+Dirty bitmaps are transferred with the disk image during migration. The target's libvirt holds no checkpoint metadata, but nothing restores it up front: the first backup on the target redefines its base as part of starting (see [Checkpoint redefinition](#checkpoint-redefinition)). If the VM state PVC is not shared, a new one is created. Incremental backups resume normally.
 
 ### VMSnapshot and backup
 
@@ -507,6 +509,9 @@ Users must opt in by enabling CBT. Rollback is equivalent to disabling CBT. No d
 - Data consistency after VM restart.
 - Failure scenarios where incremental backup is not possible (fallback to full).
 - Mixed full/incremental backup in a single job: unplug and replug a disk of a running VM to destroy its bitmap, then verify the replugged disk reports `Full` while the others stay `Incremental`.
+- A backup issued immediately after a VM restart runs incrementally, with no redefinition step preceding it.
+- Two consecutive backups from the same base both succeed, confirming redefinition at backup start is idempotent.
+- A backup after live migration runs incrementally on the target, where libvirt holds no checkpoint metadata at all.
 
 ## Known limitations
 
@@ -514,6 +519,7 @@ Users must opt in by enabling CBT. Rollback is equivalent to disabling CBT. No d
 - **Offline backup**: Only online (running VM) backup is supported today. Offline backup will be addressed by a separate VEP.
 - **State interruptions**: If the guest OS initiates a shutdown during backup, the backup is canceled and marked as failed because there is no way to finish cleanly before the domain disappears (pending [RHEL-8067](https://issues.redhat.com/browse/RHEL-8067)).
 - **Differential backup**: Only the latest checkpoint can serve as a base for incremental backup. Multi-checkpoint retention and the ability to back up from a specific previous checkpoint will be addressed by a separate VEP.
+- **Silent fallback to full**: A disk whose bitmap is missing or inconsistent is backed up in full rather than failing the backup, and the only signal is `status.includedVolumes[].type`. A base whose bitmap is gone from every disk therefore yields an all-full backup that reports success, so a vendor who does not inspect per-volume type can be surprised by the size and duration of what they requested as an incremental. There is no way to ask for the opposite behavior; a policy field selecting failure over promotion is a possible additive follow-up.
 - **Backup teardown during node drain**: A `system-critical` migration cancels an in-progress backup, but the migration stays blocked until the backup's utility volume detaches. If teardown has not completed when `utilityVolumesTimeout` (default 150 seconds) fires, the utility volume is force-detached. Pull mode is especially sensitive here: the VMExport and exportserver pod must be torn down before the scratch PVC can detach, so a drain landing on a long-lived pull-mode backup is the likeliest path to a force-detach. Metrics are exposed to give operators visibility into how often this occurs.
 - **Orphaned overlays**: Replacing a disk's backing PVC (offline or online) can leave orphaned QCOW2 overlays on the VM state PVC with no automatic reclaim path.
 
@@ -535,6 +541,7 @@ Users must opt in by enabling CBT. Rollback is equivalent to disabling CBT. No d
 ### Beta
 
 - [ ] Per-volume backup type reporting, with disk-level fallback to full for missing or inconsistent bitmaps
+- [ ] Checkpoint redefinition performed lazily at backup start, replacing the restart- and migration-triggered redefinition from alpha
 - [ ] Pull-mode internal and external endpoints reported through `status.links`
 - [ ] TTL support for both modes (Push and Pull), resulting in backup failure on expiration
 - [ ] virt-exportserver co-location with virt-launcher enforced as a hard scheduling constraint rather than a preference
